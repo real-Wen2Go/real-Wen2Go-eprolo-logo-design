@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EPROLO · e for everything</title>
+<style>
+  html,body{margin:0;height:100%;background:#0d0f0e;overflow:hidden}
+  #wrap{position:absolute;inset:0;display:grid;place-items:center}
+  canvas{width:100%;height:auto;max-height:100vh;display:block}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+/* ============================================================
+   EPROLO brand sting v3 · "e for everything."
+   ------------------------------------------------------------
+   一份源码，两种画幅：
+     ?layout=land   1920×1080 横屏（电视 / 官网 / 开屏）
+     ?layout=vert   1080×1920 竖屏（抖音 / Reels / Shorts）
+     不带参数 = 按窗口比例自动选（16:9 窗口给横屏，9:16 给竖屏）
+
+   与 v2 的差别只有布局参数化，动画曲线与时间轴完全一致：
+   全部运动都是解析弹簧（阻尼振子），有真实过冲与回弹；
+   旋转为「反向预转 → 拧进去 → 弹回 0」；
+   高速段有真运动模糊（多子帧平均 = 快门积分）。
+   ============================================================ */
+
+/* ---------------- 布局 ---------------- */
+/* GRID_FILL：商品墙放大到该边长，使圆形遮罩内切画面。
+   两种画幅的对角线恰好都是 2202.9px（半对角 1101.5），
+   所以遮罩半径 1105 一张常量就能同时满足 16:9 与 9:16。 */
+const LAYOUTS = {
+  land: {
+    W: 1920, H: 1080,
+    MCX: 960, MCY: 402, MD: 440,          // 标志中心 / 直径
+    CCX: 960, CCY: 540,                   // 内容（商品墙）原始中心
+    WORD_W: 620, WORD_Y: 736,             // 字标宽度 / 中心 y
+    SLOG_Y: 872, SLOG_SIZE: 58,           // slogan 基线 y / 字号
+    PILL: { x: 104, y: 92, w: 372, h: 66 },
+    GRID: { cols: 7, rows: 5, cw: 270, gap: 18 },
+    DRIFT: -50
+  },
+  vert: {
+    W: 1080, H: 1920,
+    MCX: 540, MCY: 790, MD: 470,
+    CCX: 540, CCY: 960,
+    WORD_W: 680, WORD_Y: 1200,            // 680/470 ≈ 横屏的 620/440，标志与字标比例一致
+    SLOG_Y: 1350, SLOG_SIZE: 64,
+    PILL: { x: 86, y: 230, w: 400, h: 72 },
+    GRID: { cols: 9, rows: 8, cw: 240, gap: 16 },   // 竖屏窄，加列加压行，密度才够
+    DRIFT: -60
+  }
+};
+const qs = new URLSearchParams(location.search);
+const ARG = qs.get('layout');
+const LKEY = ARG === 'vert' || ARG === 'land'
+  ? ARG
+  : (innerHeight > innerWidth * 1.2 ? 'vert' : 'land');
+const L = LAYOUTS[LKEY];
+
+const CW = L.W, CH = L.H;
+const cv = document.getElementById('c');
+cv.width = CW; cv.height = CH;
+const MAIN = cv.getContext('2d', { alpha: false });
+let ctx = MAIN;                                  // 做模糊时会临时切到离屏
+
+const TMP = document.createElement('canvas'); TMP.width = CW; TMP.height = CH;
+const TCTX = TMP.getContext('2d', { alpha: false });
+const ACC = document.createElement('canvas'); ACC.width = CW; ACC.height = CH;
+const ACTX = ACC.getContext('2d', { alpha: false });
+
+const GREEN = '#31CB49';
+const GREEN_RGB = '49,203,73';
+const INK = '#16211B';
+const BG = '#FAFBF9';
+
+const MCX = L.MCX, MCY = L.MCY, MD = L.MD;
+const CCX = L.CCX, CCY = L.CCY;
+const R = MD * 0.4588;                     // 环中线半径
+const STK = MD * 0.078;                    // 环厚
+const GAP = 21.4 * Math.PI / 180;          // 缺口半角（实测 33° 视觉缺口）
+const MASK_R = 1105;                       // > 画面半对角 1101.5
+const WALL_PX = 2260;                      // 商品墙放大后的短边
+
+const DUR = 2.30;
+const FPS = 60;
+const SHUTTER = 0.10 / FPS;                // 快门开合时长（36°）
+                                           // 径向模糊作用在密集网格上会煮成一锅，只用极短快门留一点方向感
+
+/* ---------- 基础缓动 ---------- */
+const cl = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, p) => a + (b - a) * p;
+const ph = (t, a, b) => cl((t - a) / (b - a));
+const eOutC = p => 1 - Math.pow(1 - p, 3);
+const eOutQ = p => 1 - Math.pow(1 - p, 2);
+const eInQ = p => p * p;
+const eInOutS = p => -(Math.cos(Math.PI * p) - 1) / 2;   // 两端速度为 0，加速度有限
+
+/* ---------- 解析弹簧（确定性，可任意 t 采样） ----------
+   p     经过秒数
+   from  起始值        to  目标值
+   zeta  阻尼比（<1 才有回弹；0.6 明显，0.8 收敛）
+   omega 固有角频率（越大越快）                                     */
+function spr(p, from, to, zeta, omega, v0 = 0) {
+  if (p <= 0) return from;
+  const d0 = from - to;
+  if (zeta >= 1) {
+    const e = Math.exp(-omega * p);
+    return to + e * (d0 + (v0 + omega * d0) * p);
+  }
+  const wd = omega * Math.sqrt(1 - zeta * zeta);
+  const B = (v0 + zeta * omega * d0) / wd;
+  return to + Math.exp(-zeta * omega * p) * (d0 * Math.cos(wd * p) + B * Math.sin(wd * p));
+}
+
+/* ---------- 资源 ---------- */
+const CARDS = Array.from({ length: 16 }, (_, i) => 'wall/w' + String(i + 1).padStart(2, '0') + '.png');
+const ASSETS = CARDS.concat(['brand/e-only.png', 'brand/wordmark.png']);
+const IM = {};
+let pending = 0;
+ASSETS.forEach(p => {
+  const im = new Image();
+  pending++;
+  im.onload = () => { pending--; if (pending === 0) buildWall(); };
+  im.onerror = () => { pending--; };
+  im.src = p;
+  IM[p] = im;
+});
+
+/* ---------- 商品墙离屏画布 ---------- */
+let WALL = null, WW = 0, WH = 0, WK = 1;
+function buildWall() {
+  if (WALL || !IM[CARDS[0]].complete) return;
+  const { cols, rows, cw, gap } = L.GRID;
+  const chh = Math.round(cw * 292 / 206);
+  WW = cols * cw + (cols - 1) * gap;
+  WH = rows * chh + (rows - 1) * gap;
+  WALL = document.createElement('canvas');
+  WALL.width = WW; WALL.height = WH;
+  const g = WALL.getContext('2d');
+  g.fillStyle = '#FFFFFF'; g.fillRect(0, 0, WW, WH);
+  for (let r = 0; r < rows; r++) {
+    for (let q = 0; q < cols; q++) {
+      const idx = (q * 5 + r * 7 + (q * r) % 3) % 16;
+      const im = IM[CARDS[idx]];
+      const x = q * (cw + gap), y = r * (chh + gap);
+      if (im && im.complete && im.naturalWidth) g.drawImage(im, x, y, cw, chh);
+      else { g.fillStyle = '#EFF2EF'; g.fillRect(x, y, cw, chh); }
+    }
+  }
+  WK = WALL_PX / Math.min(WW, WH);
+}
+
+/* ---------- 缩放：预推 + 收束是一条连续曲线 ----------
+   0.30~0.42 用二次加速把速度从 0 提到 0.55（对数尺度/秒），
+   0.42 处交给弹簧，且弹簧的初速、初位都与之严格相等。
+   这样位置连续、速度也连续，不会出现「静止突然被拽走」的顿感。      */
+const S_END = 0.168;
+const LN_END = Math.log(S_END);
+const PRE0 = 0.30, PRE1 = 0.42;
+const PUSH_V = 0.55;                                   // 交接点的速度
+const PUSH_A = PUSH_V / (2 * (PRE1 - PRE0));           // 0.55 / 0.24
+const LOG_HAND = PUSH_A * (PRE1 - PRE0) * (PRE1 - PRE0); // 交接点的缩放（1.0335）
+
+function scaleAt(t) {
+  if (t < PRE0) return 1;
+  if (t < PRE1) { const d = t - PRE0; return Math.exp(PUSH_A * d * d); }
+  return Math.exp(spr(t - PRE1, LOG_HAND, LN_END, 0.62, 10, PUSH_V));
+}
+
+/* ---------- 旋转：正弦进出拧到 −22°，再弹回 0 ---------- */
+const ROT_B = -22 * Math.PI / 180;
+const RO_T0 = 0.30, RO_T1 = 0.72;
+function rotAt(t) {
+  if (t < RO_T0) return 0;
+  if (t < RO_T1) return ROT_B * eInOutS(ph(t, RO_T0, RO_T1)); // 两端速度均为 0
+  return spr(t - RO_T1, ROT_B, 0, 0.62, 10);                  // 弹回 0，过冲约 1.8°
+}
+
+/* ---------- 绘制小工具 ---------- */
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+function txt(s, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = (o.italic ? 'italic ' : '') + (o.weight || 500) + ' ' + size + 'px ' + (o.font || '"Helvetica Neue",Arial,sans-serif');
+  ctx.fillStyle = color;
+  ctx.textAlign = o.align || 'center';
+  ctx.textBaseline = o.base || 'middle';
+  if (o.ls) ctx.letterSpacing = o.ls;
+  ctx.fillText(s, x, y);
+  ctx.restore();
+}
+
+/* ---------- 背景 ---------- */
+function bg(t) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, CW, CH);
+  const ga = 1 - ph(t, 0.75, 1.05);
+  if (ga > 0.01) {
+    ctx.save(); ctx.globalAlpha = 0.34 * ga;
+    ctx.strokeStyle = '#E3E9E2'; ctx.lineWidth = 1;
+    for (let x = 0; x <= CW; x += 60) { ctx.beginPath(); ctx.moveTo(x + .5, 0); ctx.lineTo(x + .5, CH); ctx.stroke(); }
+    for (let y = 0; y <= CH; y += 60) { ctx.beginPath(); ctx.moveTo(0, y + .5); ctx.lineTo(CW, y + .5); ctx.stroke(); }
+    ctx.restore();
+  }
+}
+
+/* ---------- 内容层：商品墙 + 计数胶囊 ---------- */
+function content(t) {
+  if (!WALL) return;
+  const a = 1 - ph(t, 1.02, 1.10);
+  if (a <= 0.001) return;
+
+  const s = scaleAt(t), rot = rotAt(t);
+  const drift = L.DRIFT * cl(t / 0.55);       // 匀速上浮，不留停顿
+
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.translate(MCX, MCY);
+  ctx.rotate(rot);
+  ctx.scale(s, s);
+  ctx.translate(-CCX, -CCY);
+
+  // 同心圆遮罩：半径 1105 ＞ 画面半对角 1102，s=1 时完全不可见
+  ctx.beginPath();
+  ctx.arc(CCX, CCY, MASK_R, 0, Math.PI * 2);
+  ctx.clip();
+
+  const w = WW * WK, h = WH * WK;
+  ctx.drawImage(WALL, CCX - w / 2, CCY - h / 2 + drift, w, h);
+
+  // 顶部计数胶囊（随内容一起被吸走）
+  const P = L.PILL, k = P.h / 66;
+  ctx.fillStyle = 'rgba(12,32,22,.92)';
+  rr(P.x, P.y, P.w, P.h, P.h / 2); ctx.fill();
+  ctx.fillStyle = GREEN;
+  ctx.beginPath(); ctx.arc(P.x + 34 * k, P.y + P.h / 2, 7 * k, 0, 7); ctx.fill();
+  txt('200,000+ products', P.x + 56 * k, P.y + P.h / 2 + 1, 26 * k, '#fff', { align: 'left', weight: 500 });
+  ctx.restore();
+}
+
+/* ---------- 收束绿光 ---------- */
+function glow(t) {
+  const g = ph(t, 0.52, 1.05);
+  if (g <= 0.001 || g >= 1) return;
+  const a = 0.09 * eOutC(g) * (1 - ph(t, 0.80, 0.98));
+  if (a <= 0.002) return;
+  const k = MD / 440;
+  const rad = lerp(760 * k, 250 * k, eOutC(g));
+  const grd = ctx.createRadialGradient(MCX, MCY, rad * 0.15, MCX, MCY, rad);
+  grd.addColorStop(0, 'rgba(' + GREEN_RGB + ',' + a.toFixed(3) + ')');
+  grd.addColorStop(1, 'rgba(' + GREEN_RGB + ',0)');
+  ctx.fillStyle = grd;
+  ctx.beginPath(); ctx.arc(MCX, MCY, rad, 0, 7); ctx.fill();
+}
+
+/* ---------- 环：自缺口上端顺时针描出；半径随圆盘收进，落定时轻微回弹 ---------- */
+function ring(t) {
+  if (t < 0.84) return;
+  const p = t - 0.84;
+  const q = eOutC(cl(p / 0.26));
+  if (q <= 0) return;
+  const rad0 = Math.max(MASK_R * scaleAt(0.84) + STK / 2, R);
+  const rad = spr(p, rad0, R, 0.78, 12);
+  const a0 = GAP, a1 = Math.PI * 2 - GAP;
+  ctx.save();
+  ctx.globalAlpha = 0.25 + 0.75 * cl(q * 5);
+  ctx.strokeStyle = GREEN;
+  ctx.lineWidth = STK;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(MCX, MCY, rad, a0, a0 + (a1 - a0) * q);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- 字母 e：弹簧弹入 ---------- */
+function letterE(t) {
+  if (t < 1.12) return;
+  const p = t - 1.12;
+  const sc = spr(p, 0.74, 1, 0.52, 15);       // 过冲约 14.8%
+  const a = eOutQ(cl(p / 0.10));
+  if (a <= 0.001) return;
+  const k = MD / 910;
+  ctx.save();
+  ctx.globalAlpha *= a;
+  ctx.translate(MCX, MCY);
+  ctx.scale(sc, sc);
+  ctx.drawImage(IM['brand/e-only.png'], -467 * k, -455 * k, 910 * k, 910 * k);
+  ctx.restore();
+}
+
+/* ---------- 扩散涟漪 ---------- */
+function ripple(t) {
+  const p = ph(t, 1.12, 1.48);
+  if (p <= 0 || p >= 1) return;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(' + GREEN_RGB + ',' + (0.30 * (1 - p) * (1 - p)).toFixed(3) + ')';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(MCX, MCY, R * lerp(0.60, 1.95, eOutC(p)), 0, 7); ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- 字标：横向擦除 + 弹性上浮 ---------- */
+function wordmark(t) {
+  if (t < 1.36) return;
+  const p = t - 1.36;
+  const q = cl(p / 0.26);
+  if (q <= 0) return;
+  const cover = eOutC(q);
+  const w = L.WORD_W, h = w * 153 / 730;
+  const x = MCX - w / 2;
+  const dy = spr(p, 16, 0, 0.55, 13);         // 从下方 16px 弹到 0，轻微过冲
+  const y = L.WORD_Y - h / 2 + dy;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x - 12, y - 20, (w + 24) * cover, h + 40);
+  ctx.clip();
+  ctx.globalAlpha *= cl(cover * 2.4);
+  ctx.drawImage(IM['brand/wordmark.png'], x, y, w, h);
+  ctx.restore();
+}
+
+/* ---------- Slogan：三个词块依次落位 ---------- */
+function slogan(t) {
+  if (t < 1.54) return;
+  const size = L.SLOG_SIZE;
+  const parts = ['e', ' for', ' everything.'];
+  const cols = [GREEN, INK, INK];
+  ctx.save();
+  ctx.font = '500 ' + size + 'px "Helvetica Neue",Arial,sans-serif';
+  const ws = parts.map(s => ctx.measureText(s).width);
+  const total = ws.reduce((a, b) => a + b, 0);
+  let x = MCX - total / 2;
+
+  for (let i = 0; i < parts.length; i++) {
+    const p = t - 1.54 - i * 0.055;
+    if (p > 0) {
+      const dy = spr(p, 18, 0, 0.50, 14);
+      const a = eOutQ(cl(p / 0.16));
+      if (a > 0.002) {
+        ctx.globalAlpha = a;
+        ctx.fillStyle = cols[i];
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(parts[i], x, L.SLOG_Y + dy);
+      }
+    }
+    x += ws[i];
+  }
+  ctx.restore();
+}
+
+/* ---------- 场景（不含模糊） ---------- */
+function scene(t) {
+  ctx.globalAlpha = 1;
+  bg(t);
+  glow(t);
+  content(t);
+
+  const br = 1 + 0.0032 * Math.sin(Math.max(0, t - 1.70) * 1.5);   // 定格后的呼吸
+  const breathe = t > 1.44;
+  if (breathe) {
+    ctx.save();
+    ctx.translate(MCX, MCY); ctx.scale(br, br); ctx.translate(-MCX, -MCY);
+  }
+  ring(t);
+  ripple(t);
+  letterE(t);
+  wordmark(t);
+  slogan(t);
+  if (breathe) ctx.restore();
+}
+
+/* ---------- 运动模糊：多子帧平均（等价快门积分） ---------- */
+function motionMag(t) {
+  const e = 1 / 120;
+  const ds = Math.abs(scaleAt(t) - scaleAt(t - e)) * MASK_R;   // 径向位移 px / 1/120s
+  const dr = Math.abs(rotAt(t) - rotAt(t - e)) * R * 4.45;     // 切向位移
+  return ds + dr * 0.8;
+}
+function blurN(t) {
+  const d = motionMag(t);
+  if (d < 8) return 1;
+  return Math.min(6, Math.round(d / 10) + 2);
+}
+
+function render(t) {
+  t = cl(t, 0, DUR);
+  const n = blurN(t);
+
+  if (n <= 1) {
+    ctx = MAIN;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    scene(t);
+    return;
+  }
+
+  ctx = TCTX;
+  for (let k = 0; k < n; k++) {
+    const tt = t - SHUTTER * (1 - k / (n - 1));
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    scene(tt);
+    ACTX.setTransform(1, 0, 0, 1, 0, 0);
+    ACTX.globalAlpha = 1 / (k + 1);          // running average
+    ACTX.drawImage(TMP, 0, 0);
+  }
+  ACTX.globalAlpha = 1;
+
+  ctx = MAIN;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.drawImage(ACC, 0, 0);
+}
+
+/* ---------- 导出 / 预览 ---------- */
+window.__frame = render;
+window.__layout = LKEY;
+window.__imgsReady = () => pending === 0 && WALL !== null;
+
+// 导出/截图时锁死 CSS 尺寸，保证 canvas 位图与视口严格 1:1（否则截图会被重采样）
+if (qs.has('export') || qs.has('still')) {
+  cv.style.width = CW + 'px';
+  cv.style.height = CH + 'px';
+  cv.style.maxHeight = 'none';
+}
+
+if (qs.has('still')) {
+  const go = () => { if (pending === 0 && WALL) render(parseFloat(qs.get('still'))); else setTimeout(go, 60); };
+  go();
+} else if (!qs.has('export')) {
+  const t0 = performance.now();
+  const loop = () => {
+    if (pending === 0 && WALL) {
+      const el = ((performance.now() - t0) / 1000) % (DUR + 1.0);
+      render(Math.min(el, DUR));
+    }
+    requestAnimationFrame(loop);
+  };
+  loop();
+}
+</script>
+</body>
+</html>

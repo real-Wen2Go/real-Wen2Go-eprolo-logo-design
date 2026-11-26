@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 910 910" width="910" height="910" role="img" aria-label="EPROLO ring">
+  <title>EPROLO ring mark</title>
+  <!-- 环：中线半径 417.5，线宽 74，右侧缺口 40.8°；stroke 可换成 currentColor 做 CSS 染色 -->
+  <path d="M 859.82 600.03 A 417.5 417.5 0 1 1 859.82 308.97" fill="none" stroke="#31CB49" stroke-width="74" stroke-linecap="round"/>
+</svg>

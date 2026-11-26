@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EPROLO · e for everything</title>
+<style>
+  html,body{margin:0;height:100%;background:#0d0f0e;overflow:hidden}
+  #wrap{position:absolute;inset:0;display:grid;place-items:center}
+  canvas{width:100%;height:auto;max-height:100vh;display:block}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="1920" height="1080"></canvas></div>
+<script>
+/* ============================================================
+   EPROLO brand sting · "e for everything."
+   1920×1080 · 2.20s · 60fps
+   结构：满屏商品墙 → 蓄力 → 加速收束进环口 → 环形描出 + 字母 e 接手
+        → 字标裁切显现 → slogan 落字
+   ============================================================ */
+
+const CW = 1920, CH = 1080;
+const c = document.getElementById('c');
+const ctx = c.getContext('2d', { alpha: false });
+
+const GREEN = '#31CB49';
+const GREEN_RGB = '49,203,73';
+const INK = '#16211B';
+const BG = '#FAFBF9';
+
+const MCX = 960, MCY = 402, MD = 440;      // 标志中心 / 直径
+const CCX = 960, CCY = 540;                // 内容原始中心
+const R = MD * 0.4588;                     // 环中线半径
+const STK = MD * 0.078;                    // 环厚
+const GAP = 21.4 * Math.PI / 180;          // 缺口半角（实测 33° 视觉缺口）
+
+const DUR = 1.90;
+
+/* ---------- 缓动 ---------- */
+const clamp = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, p) => a + (b - a) * p;
+const ph = (t, a, b) => clamp((t - a) / (b - a));
+const eOutC = p => 1 - Math.pow(1 - p, 3);
+const eOutQ = p => 1 - Math.pow(1 - p, 2);
+const eInOutS = p => -(Math.cos(Math.PI * p) - 1) / 2;
+/* cubic-bezier(.4,0,1,1) 近似：退场加速 */
+const eAccel = p => Math.pow(p, 1.6);
+/* cubic-bezier(.175,.885,.32,1.275) 近似：回弹落定 */
+function eBack(p, k = 1.32) {
+  const q = p - 1;
+  return 1 + (k + 1) * q * q * q + k * q * q;
+}
+
+/* ---------- 资源 ---------- */
+const CARDS = Array.from({ length: 16 }, (_, i) => 'wall/w' + String(i + 1).padStart(2, '0') + '.png');
+const ASSETS = CARDS.concat(['brand/e-only.png', 'brand/wordmark.png']);
+const IM = {};
+let pending = 0;
+ASSETS.forEach(p => {
+  const im = new Image();
+  pending++;
+  im.onload = () => { pending--; if (pending === 0) buildWall(); };
+  im.onerror = () => { pending--; };
+  im.src = p;
+  IM[p] = im;
+});
+
+/* ---------- 商品墙离屏画布 ---------- */
+let WALL = null, WW = 0, WH = 0, WK = 1;
+function buildWall() {
+  if (WALL || !IM[CARDS[0]].complete) return;
+  const cols = 7, rows = 5, cw = 270, gap = 18, chh = Math.round(cw * 292 / 206);
+  WW = cols * cw + (cols - 1) * gap;
+  WH = rows * chh + (rows - 1) * gap;
+  WALL = document.createElement('canvas');
+  WALL.width = WW; WALL.height = WH;
+  const g = WALL.getContext('2d');
+  g.fillStyle = '#FFFFFF'; g.fillRect(0, 0, WW, WH);
+  for (let r = 0; r < rows; r++) {
+    for (let q = 0; q < cols; q++) {
+      const idx = (q * 5 + r * 7 + (q * r) % 3) % 16;
+      const im = IM[CARDS[idx]];
+      const x = q * (cw + gap), y = r * (chh + gap);
+      if (im && im.complete && im.naturalWidth) g.drawImage(im, x, y, cw, chh);
+      else { g.fillStyle = '#EFF2EF'; g.fillRect(x, y, cw, chh); }
+    }
+  }
+  WK = 2260 / Math.min(WW, WH);
+}
+
+/* ---------- 缩放曲线（对数空间） ---------- */
+const S0 = 1.030, S1 = 0.168;
+const LN0 = Math.log(S0), LN1 = Math.log(S1);
+function scaleAt(t) {
+  if (t < 0.22) return 1.0;
+  if (t < 0.34) return lerp(1.0, S0, eOutQ(ph(t, 0.22, 0.34)));
+  return Math.exp(lerp(LN0, LN1, eAccel(ph(t, 0.34, 0.84))));
+}
+
+/* ---------- 绘制小工具 ---------- */
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, r);
+}
+function txt(s, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = (o.italic ? 'italic ' : '') + (o.weight || 500) + ' ' + size + 'px ' + (o.font || '"Helvetica Neue",Arial,sans-serif');
+  ctx.fillStyle = color;
+  ctx.textAlign = o.align || 'center';
+  ctx.textBaseline = o.base || 'middle';
+  if (o.ls) ctx.letterSpacing = o.ls;
+  ctx.fillText(s, x, y);
+  ctx.restore();
+}
+
+/* ---------- 背景 ---------- */
+function bg(t) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, CW, CH);
+  const ga = 1 - ph(t, 0.95, 1.35);
+  if (ga > 0.01) {
+    ctx.save(); ctx.globalAlpha = 0.5 * ga;
+    ctx.strokeStyle = '#E3E9E2'; ctx.lineWidth = 1;
+    for (let x = 0; x <= CW; x += 60) { ctx.beginPath(); ctx.moveTo(x + .5, 0); ctx.lineTo(x + .5, CH); ctx.stroke(); }
+    for (let y = 0; y <= CH; y += 60) { ctx.beginPath(); ctx.moveTo(0, y + .5); ctx.lineTo(CW, y + .5); ctx.stroke(); }
+    ctx.restore();
+  }
+}
+
+/* ---------- 内容层：商品墙 + 计数胶囊 ---------- */
+function content(t) {
+  if (!WALL) return;
+  const s = scaleAt(t);
+  const rot = -0.122 * eAccel(ph(t, 0.34, 0.84));
+  const alpha = 1 - ph(t, 0.82, 0.88);
+  if (alpha <= 0.001) return;
+  const drift = -52 * eOutC(ph(t, 0, 0.75));
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(MCX, MCY);
+  ctx.rotate(rot);
+  ctx.scale(s, s);
+  ctx.translate(-CCX, -CCY);
+
+  // 同心圆遮罩：半径随缩放同步收缩，终点恰好贴合环的内径
+  ctx.beginPath();
+  ctx.arc(CCX, CCY, 1105, 0, Math.PI * 2);
+  ctx.clip();
+
+  const w = WW * WK, h = WH * WK;
+  ctx.drawImage(WALL, CCX - w / 2, CCY - h / 2 + drift, w, h);
+
+  // 顶部计数胶囊（随内容一起被吸走）
+  const px = 104, py = 92, pw = 372, phh = 66;
+  ctx.fillStyle = 'rgba(12,32,22,.92)';
+  rr(px, py, pw, phh, phh / 2); ctx.fill();
+  ctx.fillStyle = GREEN;
+  ctx.beginPath(); ctx.arc(px + 34, py + phh / 2, 7, 0, 7); ctx.fill();
+  txt('200,000+ products', px + 56, py + phh / 2 + 1, 26, '#fff', { align: 'left', weight: 500 });
+  ctx.restore();
+}
+
+/* ---------- 收束绿光 ---------- */
+function glow(t) {
+  const g = ph(t, 0.56, 1.12);
+  if (g <= 0.001 || g >= 1) return;
+  const a = 0.16 * eOutC(g) * (1 - ph(t, 0.86, 1.00));
+  const rad = lerp(760, 230, eOutC(g));
+  const grd = ctx.createRadialGradient(MCX, MCY, rad * 0.15, MCX, MCY, rad);
+  grd.addColorStop(0, 'rgba(' + GREEN_RGB + ',' + a.toFixed(3) + ')');
+  grd.addColorStop(1, 'rgba(' + GREEN_RGB + ',0)');
+  ctx.fillStyle = grd;
+  ctx.beginPath(); ctx.arc(MCX, MCY, rad, 0, 7); ctx.fill();
+}
+
+/* ---------- 环：自缺口上端顺时针描出，落在 33° 缺口 ---------- */
+function ring(t) {
+  const q = eOutC(ph(t, 0.70, 0.88));
+  if (q <= 0) return;
+  const rad = Math.max(R, 1105 * scaleAt(t) + STK / 2);  // 环先贴着圆盘边缘，再随盘收进最终尺寸
+  const a0 = GAP, a1 = Math.PI * 2 - GAP;
+  const aE = a0 + (a1 - a0) * q;
+  ctx.save();
+  ctx.globalAlpha = 0.25 + 0.75 * clamp(q * 6);
+  ctx.strokeStyle = GREEN;
+  ctx.lineWidth = STK;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(MCX, MCY, rad, a0, aE);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- 字母 e ---------- */
+function letterE(t) {
+  const a = ph(t, 0.885, 1.00);
+  if (a <= 0) return;
+  const p1 = ph(t, 0.88, 1.12);
+  const sc = p1 < 1 ? lerp(0.80, 1.065, eBack(p1, 1.9)) : lerp(1.065, 1.0, eOutC(ph(t, 1.12, 1.26)));
+  const k = MD / 910;
+  ctx.save();
+  ctx.globalAlpha *= eOutQ(a) * eOutQ(a);
+  ctx.translate(MCX, MCY);
+  ctx.scale(sc, sc);
+  ctx.drawImage(IM['brand/e-only.png'], -467 * k, -455 * k, 910 * k, 910 * k);
+  ctx.restore();
+}
+
+/* ---------- 扩散涟漪 ---------- */
+function ripple(t) {
+  const p = ph(t, 0.88, 1.24);
+  if (p <= 0 || p >= 1) return;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(' + GREEN_RGB + ',' + (0.34 * (1 - p) * (1 - p)).toFixed(3) + ')';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(MCX, MCY, R * lerp(0.62, 1.95, eOutC(p)), 0, 7); ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- 字标 ---------- */
+function wordmark(t) {
+  const p = eOutC(ph(t, 1.06, 1.32));
+  if (p <= 0) return;
+  const w = 620, h = w * 153 / 730;
+  const x = MCX - w / 2, y = 736 - h / 2;
+  const slide = (1 - p) * -16;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x - 8, y - 12, (w + 16) * p, h + 24);
+  ctx.clip();
+  ctx.globalAlpha *= clamp(p * 3);
+  ctx.drawImage(IM['brand/wordmark.png'], x + slide, y, w, h);
+  ctx.restore();
+}
+
+/* ---------- slogan ---------- */
+function slogan(t) {
+  const p = eOutC(ph(t, 1.18, 1.44));
+  if (p <= 0) return;
+  const size = 58;
+  ctx.save();
+  ctx.globalAlpha *= p;
+  ctx.translate(0, (1 - p) * 16);
+  ctx.font = '500 ' + size + 'px "Helvetica Neue",Arial,sans-serif';
+  const wE = ctx.measureText('e').width;
+  const wR = ctx.measureText(' for everything.').width;
+  const x0 = MCX - (wE + wR) / 2;
+  txt('e', x0 + wE / 2, 872, size, GREEN);
+  txt(' for everything.', x0 + wE + wR / 2, 872, size, INK, { align: 'center' });
+  ctx.restore();
+}
+
+/* ---------- 主渲染 ---------- */
+function render(t) {
+  t = clamp(t, 0, DUR);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+
+  bg(t);
+  glow(t);
+  content(t);
+  ring(t);
+  ripple(t);
+  letterE(t);
+
+  // 定型后的整体呼吸
+  const br = 1 + 0.004 * Math.sin(Math.max(0, t - 1.34) * 2.0);
+  if (t > 1.06) {
+    ctx.save();
+    ctx.translate(MCX, MCY); ctx.scale(br, br); ctx.translate(-MCX, -MCY);
+  }
+  wordmark(t);
+  slogan(t);
+  if (t > 1.06) ctx.restore();
+}
+
+/* ---------- 导出 / 预览 ---------- */
+window.__frame = render;
+window.__imgsReady = () => pending === 0 && WALL !== null;
+
+const qs = new URLSearchParams(location.search);
+if (qs.has('still')) {
+  const go = () => { if (pending === 0 && WALL) render(parseFloat(qs.get('still'))); else setTimeout(go, 60); };
+  go();
+} else if (!qs.has('export')) {
+  const t0 = performance.now();
+  const loop = () => {
+    if (pending === 0 && WALL) {
+      const el = ((performance.now() - t0) / 1000) % (DUR + 0.9);
+      render(Math.min(el, DUR));
+    }
+    requestAnimationFrame(loop);
+  };
+  loop();
+}
+</script>
+</body>
+</html>

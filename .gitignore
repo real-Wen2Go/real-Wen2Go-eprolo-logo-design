@@ -1,0 +1,18 @@
+# 原始录屏：体积大，可由录屏重新裁出（见 docs/asset-inventory.md）
+assets/*.mp4
+
+# 导出/检查的中间产物
+out/shots/
+out/*.log
+ref*/
+tmp_*.png
+peek.png
+
+# 网页上传用的干净副本
+_upload/
+
+# 系统与依赖
+node_modules/
+.DS_Store
+Thumbs.db
+desktop.ini
